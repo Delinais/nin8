@@ -2,20 +2,35 @@
 """Export NINEIGHT (YM2608 / OPNA) patches as Furnace instrument files (.fui).
 
 Written from Furnace's public file-format notes (papers/newIns.md); no Furnace
-code is used. Standard library only.
+source code is copied (the one Furnace-derived datum is the 8-entry detune
+mapping below, which is a fact about the encoding). Standard library only.
 
-    nin8fui.py bank OUTDIR                  all bundled presets -> OUTDIR/NN_name.fui
-    nin8fui.py convert IN... -o OUT         preset JSON / '#patch=' URL / APVTS-id JSON -> .fui
-    nin8fui.py inspect FILE.fui... [--json] decode a .fui back into NINEIGHT terms
-    nin8fui.py refresh-bank                 (dev) rebuild nin8_presets.json from ui/webui.zip
+    nin8fui.py bank OUTDIR [--all]           nin8's preset menu -> OUTDIR/NN_name.fui
+    nin8fui.py convert IN... -o OUT          preset JSON / '#patch=' link / APVTS-id JSON -> .fui
+    nin8fui.py inspect FILE.fui... [--json]  decode a .fui back into NINEIGHT terms
+    nin8fui.py refresh-bank                  (dev) rebuild nin8_presets.json from ui/webui.zip
 
-What travels in the file (all 44 per-voice fields, so the instrument sounds the
-same as in nin8 when Furnace's YM2608 uses the ymfm core at 8 MHz):
-    algorithm, feedback, AMS, PMS and per operator AR DR SR RR SL TL KS MUL DT AM SSG-EG.
-Plus LFO speed as an instrument macro when the patch uses the LFO (AMS/PMS != 0).
-What does not (it isn't instrument data in Furnace): pan, master gain, polyphony.
+IN is a file (preset JSON, a JSON list of presets, or text containing a share
+link), a literal link, or '-' for stdin. QUOTE links in a shell: '#' starts a
+comment and '&' splits the command.
 
-Two encoding details that are easy to get wrong:
+What travels in the file: algorithm, feedback, AMS, PMS and, per operator,
+AR DR SR RR SL TL KS MUL DT AM SSG-EG (48 voice fields), plus the LFO speed as
+an instrument macro when the patch uses the LFO (AMS or PMS non-zero).
+What does not (not instrument data in Furnace): pan, master gain, polyphony.
+
+For the instrument to SOUND like it does in nin8, set up Furnace like this
+(see docs/furnace-integration.md):
+  * Settings > Emulation > YM2608 playback AND render core: "ymfm only".
+    Furnace's default is a Nuked-OPN2 + ymfm hybrid that is close but measurably
+    different on some patches.
+  * Chip clock 8 MHz (the default "Yamaha YM2608" system), default prescaler.
+  * Play notes at full volume: the exporter uses Furnace's automatic TL volume
+    scaling, so quieter notes attenuate the carriers (nin8 has no velocity).
+Furnace's LFO is a single chip-wide register, so two instruments with different
+LFO speeds playing together cannot both be right.
+
+Two encoding details that are easy to get wrong (both covered by tests):
   * Furnace keeps operators in register-slot order 1,3,2,4, so nin8 op2/op3 swap.
   * Furnace stores detune as signed-detune + 3, not as the chip's DT register code.
 """
@@ -25,9 +40,11 @@ import argparse
 import base64
 import binascii
 import json
+import os
 import re
 import struct
 import sys
+import unicodedata
 import urllib.parse
 import zipfile
 from dataclasses import dataclass, field
@@ -42,6 +59,8 @@ INS_TYPE_FM = 1                    # "FM (OPN)": what YM2608 FM1-6 prefer
 DEFAULT_VERSION = 228              # Furnace 0.6.8.x; newer builds read it without complaint
 MIN_VERSION, MAX_VERSION = 224, 256  # 224 added the block byte this writer always emits
 KVS_AUTO = 2                       # "TL volume scale: auto"; 0 would stop note volume scaling the carriers
+MAX_NAME_BYTES = 255
+MAX_STEM_BYTES = 100               # leaves room for 'NN_', '-N' and '.fui' under the 255-byte filename limit
 
 OP_FIELDS = ("ar", "dr", "sr", "rr", "sl", "tl", "ks", "mul", "dt", "am", "ssgeg")
 OP_MAX = {"ar": 31, "dr": 31, "sr": 31, "rr": 15, "sl": 15, "tl": 127,
@@ -54,6 +73,7 @@ DT_FUR_TO_REG = (7, 6, 5, 0, 1, 2, 3, 4)
 FUR_OP_ORDER = (0, 2, 1, 3)
 
 MACRO_EX3_LFO_SPEED = 7            # macro code of the OPN "LFO speed" macro
+WINDOWS_RESERVED = {"con", "prn", "aux", "nul", *(f"com{i}" for i in range(1, 10)), *(f"lpt{i}" for i in range(1, 10))}
 
 
 class PatchError(ValueError):
@@ -69,6 +89,7 @@ class Patch:
     pms: int
     lfo_freq: int
     ops: list = field(default_factory=list)   # 4 dicts keyed by OP_FIELDS
+    menu: int | None = None                   # slot in nin8's preset menu (Init = 0); None = not reachable from it
 
     def validate(self) -> "Patch":
         _check("algorithm", self.alg, 7)
@@ -101,18 +122,18 @@ class Patch:
 
 
 def _check(label: str, value, hi: int) -> int:
-    if isinstance(value, bool):
-        value = int(value)
     if isinstance(value, float) and value.is_integer():
         value = int(value)
-    if not isinstance(value, int):
-        raise PatchError(f"{label}: expected an integer, got {value!r}")
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise PatchError(f"{label}: expected an integer, got {value!r}"[:200])
     if not 0 <= value <= hi:
         raise PatchError(f"{label}={value} is out of range 0..{hi}")
     return value
 
 
-def _op(src: dict, where: str) -> dict:
+def _op(src, where: str) -> dict:
+    if not isinstance(src, dict):
+        raise PatchError(f"{where} must be an object with the operator fields")
     out = {}
     for f in OP_FIELDS:
         key = "ssgEg" if f == "ssgeg" and "ssgEg" in src else f
@@ -126,112 +147,169 @@ def _op(src: dict, where: str) -> dict:
 # Input formats
 # ---------------------------------------------------------------------------
 
-def patch_from_preset(obj: dict, name: str | None = None) -> Patch:
+def patch_from_preset(obj, name: str | None = None, default_name: str = "Custom") -> Patch:
     """nin8 UI preset JSON: {name, algorithm, feedback, lfo{freq,ams,pms}, pan, envelopes[4]}.
 
     Also accepts 'operators' as an alias for 'envelopes' and the UI's sequence
-    files ({name, instrument: {...preset}, notes: [...]})."""
+    files ({name, instrument: {...preset}, notes: [...]}); like the UI, a
+    sequence file's own name wins over the instrument's."""
+    if not isinstance(obj, dict):
+        raise PatchError(f"expected a preset object, got {type(obj).__name__}")
     if isinstance(obj.get("instrument"), dict):
         inner = dict(obj["instrument"])
-        inner.setdefault("name", obj.get("name"))
-        return patch_from_preset(inner, name)
+        inner["name"] = obj.get("name") or inner.get("name")
+        return patch_from_preset(inner, name, default_name)
     ops = obj.get("envelopes", obj.get("operators"))
     if not isinstance(ops, list) or len(ops) != 4:
         raise PatchError("preset needs an 'envelopes' list with 4 operators")
     lfo = obj.get("lfo") or {}
+    if not isinstance(lfo, dict):
+        raise PatchError("'lfo' must be an object {freq, ams, pms}")
+    menu = obj.get("menu")
     return Patch(
-        name=_clean_name(name or obj.get("name") or "Custom"),
+        name=_clean_name(name or obj.get("name") or default_name),
         alg=_check("algorithm", obj.get("algorithm", obj.get("alg")), 7),
         fb=_check("feedback", obj.get("feedback", obj.get("fb")), 7),
         ams=_check("lfo ams", lfo.get("ams", 0), 3),
         pms=_check("lfo pms", lfo.get("pms", 0), 7),
         lfo_freq=_check("lfo freq", lfo.get("freq", 0), 7),
         ops=[_op(o, f"op{n}") for n, o in enumerate(ops, 1)],
+        menu=menu if isinstance(menu, int) and not isinstance(menu, bool) else None,
     ).validate()
 
 
 def patch_from_params(params: dict, name: str = "Custom") -> Patch:
     """nin8's APVTS parameter ids: alg, fb, lfo_freq/ams/pms, op1_ar .. op4_ssgeg."""
-    ops = []
-    for n in range(1, 5):
-        ops.append({f: _check(f"op{n} {f}", params[f"op{n}_{f}"], OP_MAX[f]) for f in OP_FIELDS})
-    return Patch(name=_clean_name(name), alg=_check("algorithm", params["alg"], 7),
-                 fb=_check("feedback", params["fb"], 7),
-                 ams=_check("lfo ams", params["lfo_ams"], 3), pms=_check("lfo pms", params["lfo_pms"], 7),
-                 lfo_freq=_check("lfo freq", params["lfo_freq"], 7), ops=ops).validate()
+    def get(key: str, hi: int, label: str) -> int:
+        if key not in params:
+            raise PatchError(f"parameter '{key}' is missing")
+        return _check(label, params[key], hi)
+
+    ops = [{f: get(f"op{n}_{f}", OP_MAX[f], f"op{n} {f}") for f in OP_FIELDS} for n in range(1, 5)]
+    return Patch(name=_clean_name(name), alg=get("alg", 7, "algorithm"), fb=get("fb", 7, "feedback"),
+                 ams=get("lfo_ams", 3, "lfo ams"), pms=get("lfo_pms", 7, "lfo pms"),
+                 lfo_freq=get("lfo_freq", 7, "lfo freq"), ops=ops).validate()
 
 
-def patch_from_hash(text: str, name: str | None = None) -> Patch:
+_LINK_CHARS = r"A-Za-z0-9+/=_%\-"
+
+
+def patch_from_hash(text: str, name: str | None = None, default_name: str = "Custom") -> Patch:
     """The web app's share link: '...#patch=<base64 JSON>[&name=...]' (or just the base64).
 
     JSON is {a: algorithm, f: feedback, l: [freq, pms, ams],
              ops: 4 x [ar, dr, sr, rr, sl, tl, mul, dt, ks, am, ssgEg]}  (note the orders)."""
-    text = text.strip()
-    m = re.search(r"patch=([^&\s]+)", text)
-    b64 = urllib.parse.unquote(m.group(1) if m else text.lstrip("#"))
-    link_name = re.search(r"[&#?]name=([^&\s]*)", text)
+    text = text.strip().strip("\"'`<>[]()")
+    if "patch=" not in text and "%" in text:          # a link that was percent-encoded as a whole
+        text = urllib.parse.unquote(text)
+    m = re.search(r"patch=([" + _LINK_CHARS + r"]+)", text)
+    raw_b64 = m.group(1) if m else text.lstrip("#")
+    link_name = re.search(r"[&#?]name=([^&\s\"'<>)\]]*)", text)
     if name is None and link_name:
         name = urllib.parse.unquote(link_name.group(1))
-    b64 = b64.replace("-", "+").replace("_", "/")
+    b64 = urllib.parse.unquote(raw_b64).replace("-", "+").replace("_", "/")
     try:
         raw = base64.b64decode(b64 + "=" * (-len(b64) % 4), validate=True)
         d = json.loads(raw.decode("utf-8"))
-        ops = d["ops"]
-        lfo = d.get("l") or [0, 0, 0]
+        if not isinstance(d, dict):
+            raise ValueError("payload is not an object")
+        ops, lfo = d["ops"], d["l"]
         if len(ops) != 4 or any(len(o) != 11 for o in ops) or len(lfo) != 3:
             raise ValueError("unexpected shape")
         order = ("ar", "dr", "sr", "rr", "sl", "tl", "mul", "dt", "ks", "am", "ssgeg")
         return Patch(
-            name=_clean_name(name or "Custom"), alg=_check("algorithm", d["a"], 7),
+            name=_clean_name(name or default_name), alg=_check("algorithm", d["a"], 7),
             fb=_check("feedback", d["f"], 7), lfo_freq=_check("lfo freq", lfo[0], 7),
             pms=_check("lfo pms", lfo[1], 7), ams=_check("lfo ams", lfo[2], 3),
             ops=[{f: _check(f"op{n} {f}", v, OP_MAX[f]) for f, v in zip(order, o)}
                  for n, o in enumerate(ops, 1)],
         ).validate()
-    except (binascii.Error, UnicodeDecodeError, ValueError, KeyError, TypeError) as e:
-        if isinstance(e, PatchError):
-            raise
-        raise PatchError(f"not a NINEIGHT '#patch=' link ({type(e).__name__}: {e})") from e
+    except PatchError:
+        raise
+    except (binascii.Error, ValueError, KeyError, TypeError, RecursionError) as e:
+        shown = (text[:60] + "...") if len(text) > 60 else text
+        raise PatchError(f"not a NINEIGHT '#patch=' link ({type(e).__name__}: {e}): {shown!r}"[:240]) from e
+
+
+def _read_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8-sig")
+    except UnicodeDecodeError as e:
+        raise PatchError(f"{path}: not a UTF-8 text file") from e
 
 
 def load_patches(arg: str, name: str | None = None) -> list[Patch]:
-    """arg: a file (preset JSON, APVTS-id JSON or text holding a '#patch=' link) or a literal link."""
-    path = Path(arg)
-    try:
-        is_file = path.is_file()
-    except OSError:                        # a pasted link is usually longer than NAME_MAX
-        is_file = False
-    text = path.read_text(encoding="utf-8") if is_file else arg
-    fallback = name or (path.stem if is_file else None)
+    """arg: a file (preset JSON, APVTS-id JSON or text holding a '#patch=' link), a literal link, or '-' (stdin)."""
+    path, is_file = Path(arg), False
+    if arg != "-":
+        try:
+            is_file = path.is_file()
+        except OSError:                    # a pasted link is usually longer than NAME_MAX
+            is_file = False
+    if arg == "-":
+        text, fallback = sys.stdin.read().lstrip("﻿"), None
+    elif is_file:
+        text, fallback = _read_text(path), path.stem
+    else:
+        text, fallback = arg, None
+        bare = arg.strip().strip("\"'").lstrip("#")
+        # a share payload is base64 of '{"...' JSON, so it starts "eyJ"; anything else is a mistyped path
+        if "patch=" not in arg and "%23patch%3D" not in arg and not bare.startswith("eyJ") \
+                and not arg.lstrip().startswith(("{", "[", '"')):
+            raise PatchError(f"{arg!r}: no such file (and it is not a '#patch=' link)"[:200])
+    default = name or fallback or "Custom"
     try:
         doc = json.loads(text)
     except json.JSONDecodeError:
-        return [patch_from_hash(text, name)]
+        return [patch_from_hash(text, name, default)]
+    except (RecursionError, ValueError) as e:      # absurdly deep nesting, or an integer with thousands of digits
+        raise PatchError(f"{arg[:60]!r}: unreadable JSON ({type(e).__name__})") from e
+    if isinstance(doc, str):                                    # a quoted link
+        return [patch_from_hash(doc, name, default)]
     if isinstance(doc, dict) and isinstance(doc.get("presets"), list):   # nin8_presets.json style
         doc = doc["presets"]
     items = doc if isinstance(doc, list) else [doc]
+    if not items:
+        raise PatchError(f"{arg}: no presets found")
+    single = len(items) == 1
     out = []
-    for i, d in enumerate(items):
+    for d in items:
         if not isinstance(d, dict):
             raise PatchError(f"{arg}: expected a JSON object, got {type(d).__name__}")
         if "op1_ar" in d:
-            out.append(patch_from_params(d, name or fallback or "Custom"))
-        elif "ops" in d and "a" in d:                      # the hash payload as plain JSON
-            raw = base64.b64encode(json.dumps(d).encode()).decode()
-            out.append(patch_from_hash(raw, name or fallback))
+            out.append(patch_from_params(d, default))
+        elif "ops" in d and "a" in d:                           # the hash payload as plain JSON
+            out.append(patch_from_hash(base64.b64encode(json.dumps(d).encode()).decode(), name, default))
         else:
-            out.append(patch_from_preset(d, name if len(items) == 1 else None))
+            out.append(patch_from_preset(d, name if single else None, default))
     return out
 
 
 def _clean_name(name) -> str:
-    name = re.sub(r"[\x00-\x1f\x7f]", " ", str(name)).strip()
-    return name or "Custom"
+    """Printable, valid UTF-8, at most MAX_NAME_BYTES; bidi/format characters removed."""
+    name = str(name).encode("utf-8", "replace").decode("utf-8")
+    name = "".join(" " if unicodedata.category(c) == "Cc" else ("" if unicodedata.category(c) == "Cf" else c) for c in name)
+    name = name.strip() or "Custom"
+    return name.encode("utf-8")[:MAX_NAME_BYTES].decode("utf-8", "ignore").rstrip() or "Custom"
 
 
 def safe_filename(name: str) -> str:
-    stem = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip(" .") or "patch"
-    return stem[:80]
+    stem = "".join(c for c in name if unicodedata.category(c) != "Cf")
+    stem = re.sub(r'[<>:"/\\|?*\x00-\x1f\x7f]', "_", stem).strip(" .") or "patch"
+    stem = stem.encode("utf-8")[:MAX_STEM_BYTES].decode("utf-8", "ignore").rstrip(" .") or "patch"
+    return stem + "_" if stem.split(".")[0].lower() in WINDOWS_RESERVED else stem
+
+
+def _unique_stems(names: list[str]) -> list[str]:
+    """Filename stems that stay distinct even on case-insensitive filesystems."""
+    used, out = set(), []
+    for name in names:
+        stem, i, cand = safe_filename(name), 2, safe_filename(name)
+        while cand.lower() in used:
+            cand, i = f"{stem}-{i}", i + 1
+        used.add(cand.lower())
+        out.append(cand)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -243,7 +321,10 @@ def _feature(code: bytes, payload: bytes) -> bytes:
 
 
 def build_fui(patch: Patch, version: int = DEFAULT_VERSION, lfo_macro: str = "auto") -> bytes:
-    """One OPN FM instrument as a .fui. lfo_macro: 'auto' (when AMS/PMS != 0), 'always', 'never'."""
+    """One OPN FM instrument as a .fui. lfo_macro: 'auto' (when AMS/PMS != 0), 'always', 'never'.
+
+    'auto' leaves LFO-less instruments alone on purpose: Furnace's LFO register is chip-wide, so
+    an instrument that does not use the LFO must not reset the speed other channels rely on."""
     if not MIN_VERSION <= version <= MAX_VERSION:
         raise PatchError(f"format version must be {MIN_VERSION}..{MAX_VERSION}")
     if lfo_macro not in ("auto", "always", "never"):
@@ -270,7 +351,7 @@ def build_fui(patch: Patch, version: int = DEFAULT_VERSION, lfo_macro: str = "au
         ))
 
     out = bytearray(struct.pack("<4sHH", FUI_MAGIC, version, INS_TYPE_FM))
-    out += _feature(b"NA", patch.name.encode("utf-8") + b"\x00")
+    out += _feature(b"NA", _clean_name(patch.name).encode("utf-8") + b"\x00")
     out += _feature(b"FM", bytes(fm))
     if lfo_macro == "always" or (lfo_macro == "auto" and patch.uses_lfo):
         # One "ex3" (LFO speed) macro with a single value. Furnace's YM2608 turns that into
@@ -285,7 +366,7 @@ def build_fui(patch: Patch, version: int = DEFAULT_VERSION, lfo_macro: str = "au
 
 
 def parse_fui(data: bytes) -> tuple[Patch, dict]:
-    """Decode an OPN FM .fui (ours, or one Furnace saved) into a Patch plus {'version','type'}."""
+    """Decode an OPN FM .fui (ours, or one Furnace saved) into a Patch plus {'version','type','named'}."""
     if data[:4] != FUI_MAGIC or len(data) < 8:
         raise PatchError("not a Furnace instrument file (expected 'FINS'; the pre-0.6 format is not supported)")
     version, ins_type = struct.unpack_from("<HH", data, 4)
@@ -344,7 +425,7 @@ def _parse_ex3(b: bytes) -> int:
         return 0
     (hdr,), pos = struct.unpack_from("<H", b, 0), 2
     while pos < len(b) and b[pos] != 255:
-        if pos + hdr > len(b):
+        if hdr < 8 or pos + hdr > len(b):
             break
         code, length = b[pos], b[pos + 1]
         word = (1, 1, 2, 4)[(b[pos + 5] >> 6) & 3]       # header bytes: code len loop rel mode OPEN/TYPE/WORD delay speed
@@ -368,14 +449,15 @@ def load_bank() -> list[Patch]:
 
 
 def extract_bundle_presets(js: str) -> list[dict]:
-    """Pull every preset literal out of the UI's minified bundle. Dev-time only (refresh-bank/tests)."""
+    """Pull every preset literal out of the UI's minified bundle, annotated with its slot in the
+    UI's preset menu ('menu': 1.. or None when the UI never offers it). Dev-time only."""
     spreads = set(re.findall(r"lfo:\{\.\.\.([A-Za-z_$][\w$]*)\}", js))
     for var in spreads:
         if not re.search(r"[,;\s]" + re.escape(var) + r"=\{freq:0,ams:0,pms:0\}", js):
             raise PatchError(f"preset LFO spreads '{var}' but its definition is no longer all-zero/obvious")
-    presets = []
+    found = []                                            # (position, preset)
     for m in re.finditer(r'\{name:"', js):
-        end = _match_brace(js, m.start())
+        end = _match_bracket(js, m.start(), "{", "}")
         lit = js[m.start():end]
         if "envelopes:[" not in lit or "algorithm:" not in lit:
             continue
@@ -383,13 +465,41 @@ def extract_bundle_presets(js: str) -> list[dict]:
             lit = lit.replace("lfo:{..." + var + "}", "lfo:{freq:0,ams:0,pms:0}")
         as_json = re.sub(r"([{,])([A-Za-z_$][\w$]*):", r'\1"\2":', lit)
         try:
-            presets.append(json.loads(as_json))
+            found.append((m.start(), json.loads(as_json)))
         except json.JSONDecodeError as e:
             raise PatchError(f"preset literal no longer plain JSON-like ({e}): {lit[:80]}...") from e
-    return [p for p in presets if p.get("name") != "Init"]
+    found = [(pos, p) for pos, p in found if p.get("name") != "Init"]
+    menu = _menu_slots(js, found)
+    presets = []
+    for pos, p in found:
+        presets.append(dict(p, menu=menu.get(pos)))
+    listed = sorted((p for p in presets if p["menu"] is not None), key=lambda p: p["menu"])
+    return listed + [p for p in presets if p["menu"] is None]
 
 
-def _match_brace(s: str, start: int) -> int:
+def _menu_slots(js: str, found: list) -> dict:
+    """Map preset position -> slot in the UI's preset dropdown, parsed from
+    'presets=[{name:"Init",...},...A,...B.slice(0,15)]'. Empty (no annotation) if the pattern is gone."""
+    m = re.search(r'presets=\[\{name:"Init".*?envelopes:\[(?:\{[^{}]*\},?){4}\]\}((?:,\.\.\.[\w$]+(?:\.slice\(\d+,\d+\))?)+)\]', js, re.S)
+    if not m:
+        return {}
+    slots, n = {}, 0
+    for var, lo, hi in re.findall(r",\.\.\.([\w$]+)(?:\.slice\((\d+),(\d+)\))?", m.group(1)):
+        decl = re.search(r"(?<![\w$.])" + re.escape(var) + r'=\[\{name:"', js)
+        if not decl:
+            return {}
+        start = decl.end() - len('[{name:"')
+        end = _match_bracket(js, start, "[", "]")
+        members = [pos for pos, _ in found if start < pos < end]
+        if lo:
+            members = members[int(lo):int(hi)]
+        for pos in members:
+            n += 1
+            slots[pos] = n
+    return slots
+
+
+def _match_bracket(s: str, start: int, open_c: str, close_c: str) -> int:
     depth, i, in_str = 0, start, None
     while i < len(s):
         c = s[i]
@@ -400,14 +510,14 @@ def _match_brace(s: str, start: int) -> int:
                 in_str = None
         elif c in "\"'`":
             in_str = c
-        elif c == "{":
+        elif c == open_c:
             depth += 1
-        elif c == "}":
+        elif c == close_c:
             depth -= 1
             if depth == 0:
                 return i + 1
         i += 1
-    raise PatchError("unbalanced braces in bundle")
+    raise PatchError("unbalanced brackets in bundle")
 
 
 def bundle_presets_from_zip(zip_path: Path = UI_ZIP) -> list[dict]:
@@ -422,26 +532,43 @@ def bundle_presets_from_zip(zip_path: Path = UI_ZIP) -> list[dict]:
 # CLI
 # ---------------------------------------------------------------------------
 
-def _write(path: Path, patch: Patch, args) -> None:
-    path.write_bytes(build_fui(patch, args.format_version, args.lfo_macro))
-    print(f"{path}  ({patch.name})")
+def _write_all(items: list, args) -> None:
+    """items: [(path, patch)]. Everything is encoded before anything is written, and each file
+    is replaced atomically, so a failure never leaves a truncated or half-written set."""
+    encoded = [(path, build_fui(patch, args.format_version, args.lfo_macro), patch) for path, patch in items]
+    for path, data, patch in encoded:
+        tmp = path.with_name(path.name + ".part")
+        try:
+            tmp.write_bytes(data)
+            os.replace(tmp, path)
+        except BaseException:
+            tmp.unlink(missing_ok=True)
+            raise
+        print(f"{path}  ({patch.name})")
 
 
 def cmd_bank(args) -> None:
+    bank = load_bank()
+    wanted = {n.lower() for n in args.only}
+    has_menu = any(p.menu is not None for p in bank)
+    pool = bank if (args.all or wanted or not has_menu) else [p for p in bank if p.menu is not None]
+    if wanted:
+        pool = [p for p in pool if p.name.lower() in wanted]
+        if not pool:
+            raise PatchError("no bundled preset is named " + ", ".join(args.only))
+    nxt = max((p.menu or 0 for p in bank), default=0)
+    items, stems = [], _unique_stems([p.name for p in pool])
+    for p, stem in zip(pool, stems):
+        if p.menu is None:
+            nxt += 1
+        items.append((f"{(p.menu if p.menu is not None else nxt):02d}_{stem}.fui", p))
     out = Path(args.outdir)
     out.mkdir(parents=True, exist_ok=True)
-    bank = load_bank()
-    width = len(str(len(bank)))
-    wanted = {n.lower() for n in args.only}
-    count = 0
-    for i, p in enumerate(bank, 1):
-        if wanted and p.name.lower() not in wanted:
-            continue
-        _write(out / f"{i:0{width}d}_{safe_filename(p.name)}.fui", p, args)
-        count += 1
-    if wanted and not count:
-        raise PatchError("no bundled preset matches " + ", ".join(args.only))
-    print(f"{count} instrument(s) written. In Furnace: Instruments > Open, multi-select to load them all.")
+    _write_all([(out / f, p) for f, p in items], args)
+    hidden = sum(p.menu is None for p in bank) if has_menu and not (args.all or wanted) else 0
+    print(f"{len(items)} instrument(s) written; numbers match nin8's preset menu (Up/Down keys)."
+          + (f" {hidden} more presets exist in the bundle but nin8 never offers them; add --all." if hidden else "")
+          + " In Furnace: Instruments > Open, multi-select to load them all.")
 
 
 def cmd_convert(args) -> None:
@@ -449,13 +576,12 @@ def cmd_convert(args) -> None:
     for src in args.inputs:
         patches += load_patches(src, args.name if len(args.inputs) == 1 else None)
     target = Path(args.output)
-    as_dir = target.is_dir() or str(args.output).endswith(("/", "\\")) or len(patches) > 1
-    if as_dir:
+    if target.is_dir() or str(args.output).endswith(("/", "\\")) or len(patches) > 1:
         target.mkdir(parents=True, exist_ok=True)
-        for p in patches:
-            _write(target / f"{safe_filename(p.name)}.fui", p, args)
+        items = [(target / f"{stem}.fui", p) for stem, p in zip(_unique_stems([p.name for p in patches]), patches)]
     else:
-        _write(target, patches[0], args)
+        items = [(target, patches[0])]
+    _write_all(items, args)
 
 
 def cmd_inspect(args) -> None:
@@ -477,13 +603,15 @@ def cmd_refresh_bank(args) -> None:
     presets = bundle_presets_from_zip(Path(args.ui))
     for p in presets:
         patch_from_preset(p)                                 # range-check every one
-    doc = {"generated_by": "scripts/nin8fui.py refresh-bank",
-           "source": "ui/webui.zip assets/index-*.js",
-           "note": "Presets carry no origin or licence metadata in the UI bundle.",
-           "presets": presets}
-    BANK_PATH.write_text("{\n \"generated_by\": %s,\n \"source\": %s,\n \"note\": %s,\n \"presets\": [\n%s\n ]\n}\n" % (
-        json.dumps(doc["generated_by"]), json.dumps(doc["source"]), json.dumps(doc["note"]),
-        ",\n".join("  " + json.dumps(p, separators=(",", ":")) for p in presets)), encoding="utf-8")
+    if not any(p["menu"] is not None for p in presets):
+        print("warning: could not find the UI's preset menu; 'menu' left empty", file=sys.stderr)
+    header = {"generated_by": "scripts/nin8fui.py refresh-bank",
+              "source": "ui/webui.zip assets/index-*.js",
+              "note": "Presets carry no origin or licence metadata in the UI bundle. 'menu' is the slot in "
+                      "nin8's preset menu (Init = 0); null = in the bundle but never offered by the UI."}
+    body = ",\n".join("  " + json.dumps(p, separators=(",", ":")) for p in presets)
+    BANK_PATH.write_text("{\n" + "".join(f' "{k}": {json.dumps(v)},\n' for k, v in header.items())
+                         + ' "presets": [\n' + body + "\n ]\n}\n", encoding="utf-8")
     print(f"{len(presets)} presets -> {BANK_PATH}")
 
 
@@ -497,14 +625,15 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--lfo-macro", choices=("auto", "always", "never"), default="auto",
                        help="add the LFO-speed macro: auto = when AMS/PMS is non-zero (default)")
 
-    p = sub.add_parser("bank", help="export every bundled preset")
+    p = sub.add_parser("bank", help="export the presets from nin8's preset menu")
     p.add_argument("outdir")
-    p.add_argument("--only", nargs="+", default=[], metavar="NAME", help="only presets with these names")
+    p.add_argument("--all", action="store_true", help="also the bundled presets nin8's menu never offers")
+    p.add_argument("--only", nargs="+", default=[], metavar="NAME", help="only presets with these names (implies --all)")
     common(p)
     p.set_defaults(fn=cmd_bank)
 
-    p = sub.add_parser("convert", help="convert preset JSON / '#patch=' links to .fui")
-    p.add_argument("inputs", nargs="+", help="file, or a literal '#patch=...' link / base64")
+    p = sub.add_parser("convert", help="convert preset JSON / '#patch=' links to .fui (quote links in the shell)")
+    p.add_argument("inputs", nargs="+", help="file, a literal '#patch=...' link / base64, or '-' for stdin")
     p.add_argument("-o", "--output", required=True, help="output .fui file, or a directory")
     p.add_argument("--name", help="instrument name (single input only)")
     common(p)
@@ -528,6 +657,9 @@ def main(argv=None) -> int:
     except (PatchError, OSError, zipfile.BadZipFile) as e:
         print(f"nin8fui: {e}", file=sys.stderr)
         return 1
+    except Exception as e:                        # safety net: never show a traceback for bad input
+        print(f"nin8fui: unexpected {type(e).__name__}: {str(e)[:200]} (please report this input)", file=sys.stderr)
+        return 2
     return 0
 
 

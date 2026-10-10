@@ -69,6 +69,50 @@ Troubleshooting:
 - Image build killed (out of memory during LTO) — `NIN8_BUILD_JOBS=4` in `.env`.
 - Bumping the JUCE submodule? Update `JUCE_COMMIT` in the [`Dockerfile`](Dockerfile) to match.
 
+## Furnace integration (patch export)
+
+[Furnace](https://github.com/tildearrow/furnace) has its own YM2608 built on the same
+ymfm core, so the useful link is patch transfer: design in NINEIGHT, then sequence and
+render in Furnace. `scripts/nin8fui.py` (Python 3, no dependencies) writes NINEIGHT
+patches as Furnace instrument files (`.fui`) that a **stock Furnace** loads. Design notes,
+verification status and the game-audio pipeline are in
+[docs/furnace-integration.md](docs/furnace-integration.md).
+
+```sh
+python3 scripts/nin8fui.py bank ~/furnace-nin8     # nin8's 31 menu presets -> 01_Lead 1.fui, 02_bb.fui, ...
+                                                   #   (--all adds the 17 bundled presets nin8's menu never offers)
+python3 scripts/nin8fui.py convert 'https://…/#patch=…' -o wobble.fui --name Wobble   # a web-app share link
+python3 scripts/nin8fui.py convert preset.json -o out.fui    # preset JSON (the UI's Ctrl+D / drop format)
+python3 scripts/nin8fui.py inspect wobble.fui                # decode a .fui in NINEIGHT terms
+python3 scripts/test_nin8fui.py                              # tests
+```
+
+Quote share links (`#` and `&` mean something to a shell). File numbers match nin8's preset
+menu, so `14_Manbow bass.fui` is the 14th preset (Up/Down keys). In Furnace use
+**Instruments → Open** (multi-select; clicking a file previews it); right-click → *Open →
+replace* refreshes an instrument in place and keeps the slot used by your patterns.
+
+To sound like nin8, set Furnace up like this:
+
+- **Settings → Emulation → Playback and Render core(s) → YM2608: "ymfm only".** Furnace's
+  default is a Nuked-OPN2 + ymfm hybrid that is close but measurably different on some patches.
+- Chip clock **8 MHz** (the plain "Yamaha YM2608" system; the PC-98 presets use 7.987 MHz, about 3 cents flat).
+- Play notes at **full volume**: the instrument uses Furnace's automatic TL volume scaling, so
+  quieter notes attenuate the carriers (nin8 has no velocity).
+
+All 48 voice fields travel (algorithm, feedback, AMS, PMS, 4 × 11 operator fields), plus the LFO
+speed as an instrument macro when the patch uses the LFO. Pan, master gain and polyphony are not
+instrument data in Furnace. Furnace has a single chip-wide LFO, so instruments with different LFO
+speeds cannot play together.
+
+Getting *your own* edits out of the plugin is not possible yet (the embedded WebKit has no download
+handler, and nin8's engine only picks up the UI state on the first key press). Today: the bundled
+presets, a share link from the web app, or hand-written preset JSON. A native auto-export folder
+is the planned next step.
+
+The bundled presets carry no origin or licence information. Check where a preset came from
+before shipping it in a game.
+
 ## Build (macOS — VST3 + AU + Standalone)
 
 Requires Xcode (or Command Line Tools) and CMake ≥ 3.22. The `FORMATS` line i
