@@ -20,6 +20,55 @@ Outputs land in `build/Nineight_artefacts/Release/{VST3,Standalone}` and are cop
 
 Deps: `libwebkit2gtk-4.0-dev` + usual JUCE X11/ALSA packages.
 
+## Run in Docker (Linux desktop)
+
+Runs the **Standalone** synth from a lean Alpine image: the window opens on your
+desktop and the sound goes out through your host's PipeWire/PulseAudio, in the
+spirit of `run-mtgo`. Nothing to install besides Docker; JUCE is fetched at the
+pinned commit during the build, so a plain `git clone` (no submodules) is enough.
+(VST3/AU plugins are not part of this — build natively for a DAW.)
+
+```sh
+docker compose up --build -d      # build the image and open NINEIGHT on your desktop
+docker compose logs -f            # startup problems show up here
+docker compose down               # stop (closing the window also stops it)
+```
+
+Run it as your normal user from a terminal inside your desktop session — **not
+with sudo**: the session's `DISPLAY` / `XAUTHORITY` / `XDG_RUNTIME_DIR` are what get
+wired into the container. It assumes uid/gid 1000 (the first user on Arch/Garuda);
+for anything else run `./docker/setup.sh` once. It checks Docker, X11, audio and
+MIDI on the host and writes `.env` with your uid/gid.
+
+**Arch / Garuda host setup** (Dr460nized/KDE Plasma on Wayland or X11 both work):
+
+```sh
+sudo pacman -S docker docker-compose docker-buildx
+sudo systemctl enable --now docker.socket
+sudo usermod -aG docker "$USER"   # log out and back in afterwards
+```
+
+How it reaches the desktop (all in [`compose.yaml`](compose.yaml)):
+
+| Piece | Mechanism |
+| --- | --- |
+| Window | Host X11 socket + your `XAUTHORITY` cookie, container runs as your uid and shares the host UTS namespace so the cookie matches. On a Wayland session this goes through XWayland — JUCE embeds the WebKit UI over X11, so native Wayland isn't possible. |
+| Audio | `$XDG_RUNTIME_DIR/pulse` (PipeWire's `pipewire-pulse`, or PulseAudio) mounted in; JUCE's ALSA backend reaches it through `alsa-plugins-pulse`. No `/dev/snd` needed. Pick "Default"/"Pulseaudio" in the app's audio settings. |
+| MIDI (optional) | `/dev/snd/seq` via [`compose.midi.yaml`](compose.midi.yaml), enabled automatically by `docker/setup.sh` when the device exists. |
+| Settings | Named volume `nin8_nin8-home` (`~/.config/NINEIGHT`: audio device, etc.). |
+| GPU | Not used — JUCE pins WebKit to software rendering, so no `/dev/dri`. |
+
+Troubleshooting:
+
+- `bind source path does not exist: …` — compose names the missing host path:
+  `…/pulse` means PipeWire-pulse isn't running; an `Xauthority` path means `XAUTHORITY`
+  isn't exported in the shell you ran compose from.
+- Container exits at once — `docker compose logs` (the entrypoint says what's missing).
+- `Authorization required` / can't open display — the cookie isn't readable: run as
+  the desktop user, and check `NIN8_UID`/`NIN8_GID` in `.env` match `id`.
+- Image build killed (out of memory during LTO) — `NIN8_BUILD_JOBS=4` in `.env`.
+- Bumping the JUCE submodule? Update `JUCE_COMMIT` in the [`Dockerfile`](Dockerfile) to match.
+
 ## Build (macOS — VST3 + AU + Standalone)
 
 Requires Xcode (or Command Line Tools) and CMake ≥ 3.22. The `FORMATS` line i

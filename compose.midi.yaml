@@ -1,0 +1,16 @@
+# Optional: hardware MIDI input through the host's ALSA sequencer.
+#
+#   docker compose -f compose.yaml -f compose.midi.yaml up --build -d
+#
+# docker/setup.sh enables this for you (COMPOSE_FILE in .env) when /dev/snd/seq
+# exists. It is a separate file because compose fails to start a container whose
+# listed device is missing, and /dev/snd/seq only exists once the snd-seq kernel
+# module is loaded (e.g. after plugging in a USB MIDI keyboard).
+
+services:
+  nin8:
+    devices:
+      - /dev/snd/seq:/dev/snd/seq
+    group_add:
+      # numeric gid of the host's "audio" group (written to .env by docker/setup.sh)
+      - "${AUDIO_GID:?run docker/setup.sh to detect the host audio group}"

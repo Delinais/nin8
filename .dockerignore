@@ -1,0 +1,13 @@
+# Keep the build context small and make sure a host-side build tree / JUCE
+# checkout (whose .git is a dangling submodule pointer in here) never leaks in:
+# the Dockerfile fetches JUCE itself.
+.git
+.github
+.env
+build
+third_party/JUCE
+tools
+scripts
+nin8-vst.png
+*.md
+docker/setup.sh
